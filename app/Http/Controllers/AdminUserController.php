@@ -10,6 +10,8 @@ use App\Services\AdminAuditLogger;
 
 class AdminUserController extends Controller
 {
+    private const USERS_ROUTE = '/admin/users';
+
     public function index()
     {
         return view('admin.users.index', [
@@ -48,7 +50,7 @@ class AdminUserController extends Controller
             'is_active' => $user->is_active,
         ]);
 
-        return redirect('/admin/users')->with('status', 'Admin user created.');
+        return redirect(self::USERS_ROUTE)->with('status', 'Admin user created.');
     }
 
     public function edit(AdminUser $adminUser)
@@ -86,7 +88,7 @@ class AdminUserController extends Controller
             'is_active' => $adminUser->is_active,
         ]);
 
-        return redirect('/admin/users')->with('status', 'Admin user updated.');
+        return redirect(self::USERS_ROUTE)->with('status', 'Admin user updated.');
     }
 
     public function destroy(Request $request, AdminUser $adminUser)
@@ -98,7 +100,7 @@ class AdminUserController extends Controller
             'email' => $adminUser->email,
         ]);
 
-        return redirect('/admin/users')->with('status', 'Admin user removed.');
+        return redirect(self::USERS_ROUTE)->with('status', 'Admin user removed.');
     }
 
     private function isAdmin(Request $request): bool

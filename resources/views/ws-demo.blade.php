@@ -128,8 +128,12 @@
             </div>
         </div>
 
-        <script src="https://unpkg.com/pusher-js@8.2.0/dist/web/pusher.min.js"></script>
-        <script src="https://unpkg.com/laravel-echo@1.16.0/dist/echo.iife.js"></script>
+        <script src="https://unpkg.com/pusher-js@8.2.0/dist/web/pusher.min.js"
+                integrity="sha256-+ds/9n0yh0+RQciTuOSBWSGYYwdN8LrNVR93R76EkWM="
+                crossorigin="anonymous"></script>
+        <script src="https://unpkg.com/laravel-echo@1.16.0/dist/echo.iife.js"
+                integrity="sha256-/NeRh3MNrcNNNYC5LJFUkSUCmmcnfCdq5SCVmpDbl0A="
+                crossorigin="anonymous"></script>
         <script>
             const log = document.getElementById('log');
             const echo = new Echo({

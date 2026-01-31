@@ -26,12 +26,7 @@ class NotificationController extends Controller
         $traceId = $request->attributes->get('trace_id');
         $spanId = $request->attributes->get('span_id');
 
-        $existingBatch = null;
-        if (!empty($batchData['idempotency_key'])) {
-            $existingBatch = NotificationBatch::query()
-                ->where('idempotency_key', $batchData['idempotency_key'])
-                ->first();
-        }
+        $existingBatch = $this->findExistingBatch($batchData);
 
         if ($existingBatch) {
             return response()->json([
@@ -57,66 +52,26 @@ class NotificationController extends Controller
             &$duplicates,
             &$results
         ) {
-            if ($batchData || count($notificationsData) > 1) {
-                $metadata = $batchData['metadata'] ?? [];
-                if (!is_array($metadata)) {
-                    $metadata = [];
-                }
-                $metadata = array_merge([
-                    'trace_id' => $traceId,
-                    'span_id' => $spanId,
-                ], $metadata);
-
-                $batch = NotificationBatch::create([
-                    'idempotency_key' => $batchData['idempotency_key'] ?? null,
-                    'correlation_id' => $batchData['correlation_id'] ?? $correlationId,
-                    'trace_id' => $traceId,
-                    'span_id' => $spanId,
-                    'status' => 'pending',
-                    'total_count' => count($notificationsData),
-                    'metadata' => $metadata,
-                ]);
-            }
+            $batch = $this->createBatchIfNeeded(
+                $batchData,
+                $notificationsData,
+                $correlationId,
+                $traceId,
+                $spanId
+            );
 
             $renderer = app(TemplateRenderer::class);
 
             foreach ($notificationsData as $notificationData) {
                 $idempotencyKey = $notificationData['idempotency_key'] ?? null;
-                $existing = $idempotencyKey
-                    ? Notification::query()->where('idempotency_key', $idempotencyKey)->first()
-                    : null;
-
-                if ($existing) {
-                    throw new HttpResponseException(response()->json([
-                        'message' => 'Notification idempotency key already exists.',
-                        'idempotency_key' => $idempotencyKey,
-                        'notification_id' => $existing->id,
-                    ], 409));
-                    continue;
-                }
+                $this->ensureNotificationIdempotent($idempotencyKey);
 
                 $priority = $notificationData['priority'] ?? 'normal';
-                $scheduledAt = isset($notificationData['scheduled_at'])
-                    ? Carbon::parse($notificationData['scheduled_at'])
-                    : null;
-                $status = $scheduledAt && $scheduledAt->isFuture() ? 'scheduled' : 'pending';
+                $scheduledAt = $this->parseScheduledAt($notificationData);
+                $status = $this->resolveStatus($scheduledAt);
 
-                $content = $notificationData['content'] ?? null;
-                if (!$content && !empty($notificationData['template_id'])) {
-                    $template = NotificationTemplate::query()->findOrFail($notificationData['template_id']);
-                    $variables = array_merge(
-                        $template->default_variables ?? [],
-                        $notificationData['variables'] ?? []
-                    );
-                    $content = $renderer->render($template->content, $variables);
-                }
-
-                $limits = config('notifications.content_limits');
-                if (isset($limits[$notificationData['channel']]) && mb_strlen($content ?? '') > $limits[$notificationData['channel']]) {
-                    throw ValidationException::withMessages([
-                        "notifications" => ["Rendered content exceeds {$limits[$notificationData['channel']]} characters for {$notificationData['channel']}."],
-                    ]);
-                }
+                $content = $this->resolveContent($notificationData, $renderer);
+                $this->assertContentWithinLimits($notificationData['channel'], $content);
 
                 $notification = Notification::create([
                     'batch_id' => $batch?->id,
@@ -276,5 +231,110 @@ class NotificationController extends Controller
             'last_error' => $notification->last_error,
             'created_at' => optional($notification->created_at)->toIso8601String(),
         ];
+    }
+
+    private function findExistingBatch(?array $batchData): ?NotificationBatch
+    {
+        $idempotencyKey = $batchData['idempotency_key'] ?? null;
+        if (!$idempotencyKey) {
+            return null;
+        }
+
+        return NotificationBatch::query()
+            ->where('idempotency_key', $idempotencyKey)
+            ->first();
+    }
+
+    private function createBatchIfNeeded(
+        ?array $batchData,
+        array $notificationsData,
+        ?string $correlationId,
+        ?string $traceId,
+        ?string $spanId
+    ): ?NotificationBatch {
+        if (!$batchData && count($notificationsData) <= 1) {
+            return null;
+        }
+
+        $metadata = $batchData['metadata'] ?? [];
+        if (!is_array($metadata)) {
+            $metadata = [];
+        }
+        $metadata = array_merge([
+            'trace_id' => $traceId,
+            'span_id' => $spanId,
+        ], $metadata);
+
+        return NotificationBatch::create([
+            'idempotency_key' => $batchData['idempotency_key'] ?? null,
+            'correlation_id' => $batchData['correlation_id'] ?? $correlationId,
+            'trace_id' => $traceId,
+            'span_id' => $spanId,
+            'status' => 'pending',
+            'total_count' => count($notificationsData),
+            'metadata' => $metadata,
+        ]);
+    }
+
+    private function ensureNotificationIdempotent(?string $idempotencyKey): void
+    {
+        if (!$idempotencyKey) {
+            return;
+        }
+
+        $existing = Notification::query()->where('idempotency_key', $idempotencyKey)->first();
+        if (!$existing) {
+            return;
+        }
+
+        throw new HttpResponseException(response()->json([
+            'message' => 'Notification idempotency key already exists.',
+            'idempotency_key' => $idempotencyKey,
+            'notification_id' => $existing->id,
+        ], 409));
+    }
+
+    private function parseScheduledAt(array $notificationData): ?Carbon
+    {
+        return isset($notificationData['scheduled_at'])
+            ? Carbon::parse($notificationData['scheduled_at'])
+            : null;
+    }
+
+    private function resolveStatus(?Carbon $scheduledAt): string
+    {
+        return $scheduledAt && $scheduledAt->isFuture() ? 'scheduled' : 'pending';
+    }
+
+    private function resolveContent(array $notificationData, TemplateRenderer $renderer): ?string
+    {
+        $content = $notificationData['content'] ?? null;
+        if ($content || empty($notificationData['template_id'])) {
+            return $content;
+        }
+
+        $template = NotificationTemplate::query()->findOrFail($notificationData['template_id']);
+        $variables = array_merge(
+            $template->default_variables ?? [],
+            $notificationData['variables'] ?? []
+        );
+
+        return $renderer->render($template->content, $variables);
+    }
+
+    private function assertContentWithinLimits(string $channel, ?string $content): void
+    {
+        $limits = config('notifications.content_limits');
+        if (!isset($limits[$channel])) {
+            return;
+        }
+
+        if (mb_strlen($content ?? '') <= $limits[$channel]) {
+            return;
+        }
+
+        throw ValidationException::withMessages([
+            'notifications' => ["Rendered content exceeds {$limits[$channel]} characters for {$channel}."],
+        ]);
     }
 }

@@ -13,6 +13,8 @@ use Illuminate\Support\Facades\Redis;
 
 class AdminDashboardController extends Controller
 {
+    private const COUNT_TOTAL = 'count(*) as total';
+
     public function index(Request $request)
     {
         $metrics = $this->gatherMetrics();
@@ -62,7 +64,7 @@ class AdminDashboardController extends Controller
     private function gatherMetrics(): array
     {
         $statusCounts = Notification::query()
-            ->select('status', DB::raw('count(*) as total'))
+            ->select('status', DB::raw(self::COUNT_TOTAL))
             ->groupBy('status')
             ->pluck('total', 'status')
             ->toArray();
@@ -127,7 +129,7 @@ class AdminDashboardController extends Controller
     private function gatherFailureStats(): array
     {
         $codes = DeadLetterNotification::query()
-            ->select('error_code', DB::raw('count(*) as total'))
+            ->select('error_code', DB::raw(self::COUNT_TOTAL))
             ->whereNotNull('error_code')
             ->groupBy('error_code')
             ->orderByDesc('total')
@@ -135,7 +137,7 @@ class AdminDashboardController extends Controller
             ->get();
 
         $channels = DeadLetterNotification::query()
-            ->select('channel', DB::raw('count(*) as total'))
+            ->select('channel', DB::raw(self::COUNT_TOTAL))
             ->whereNotNull('channel')
             ->groupBy('channel')
             ->orderByDesc('total')
@@ -143,7 +145,7 @@ class AdminDashboardController extends Controller
             ->get();
 
         $types = Notification::query()
-            ->select('error_type', DB::raw('count(*) as total'))
+            ->select('error_type', DB::raw(self::COUNT_TOTAL))
             ->where('status', 'failed')
             ->whereNotNull('error_type')
             ->groupBy('error_type')

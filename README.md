@@ -1,7 +1,5 @@
 # Event-Driven Notification System
 
-![CI](https://github.com/your-org/your-repo/actions/workflows/ci.yml/badge.svg)
-
 Scalable, multi-channel notification system built with Laravel 12. Handles high throughput, rate limiting, retries, and real-time status tracking for SMS, Email, and Push channels.
 
 Architecture: see `ARCHITECTURE.md`.

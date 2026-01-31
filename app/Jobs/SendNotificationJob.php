@@ -40,35 +40,7 @@ class SendNotificationJob implements ShouldQueue
             return;
         }
 
-        if (in_array($notification->status, ['sent', 'failed', 'cancelled'], true)) {
-            return;
-        }
-
-        $processingTimeout = (int) config('notifications.retry.processing_timeout_seconds', 300);
-        if ($notification->status === 'processing' && $notification->processing_started_at) {
-            if ($notification->processing_started_at->diffInSeconds(now()) < $processingTimeout) {
-                return;
-            }
-        }
-
-        if ($notification->scheduled_at && $notification->scheduled_at->isFuture()) {
-            $this->release(30);
-            return;
-        }
-
-        $ttlHours = (int) config('notifications.retry.delivery_ttl_hours', 24);
-        if ($notification->created_at && $notification->created_at->lt(now()->subHours($ttlHours))) {
-            $notification->status = 'failed';
-            $notification->last_error = 'Notification expired before delivery.';
-            $notification->error_type = 'expired';
-            $notification->error_code = 'expired';
-            $notification->save();
-            return;
-        }
-
-        if ($notification->status === 'retrying' && $notification->next_retry_at && $notification->next_retry_at->isFuture()) {
-            $delay = $notification->next_retry_at->diffInSeconds(now());
-            $this->release(max(1, $delay));
+        if (!$this->shouldProcess($notification)) {
             return;
         }
 
@@ -109,6 +81,73 @@ class SendNotificationJob implements ShouldQueue
         } catch (\Throwable $exception) {
             return false;
         }
+    }
+
+    private function shouldProcess(Notification $notification): bool
+    {
+        if (in_array($notification->status, ['sent', 'failed', 'cancelled'], true)) {
+            return false;
+        }
+
+        if ($this->isProcessingStillFresh($notification)) {
+            return false;
+        }
+
+        if ($notification->scheduled_at && $notification->scheduled_at->isFuture()) {
+            $this->release(30);
+            return false;
+        }
+
+        if ($this->isExpired($notification)) {
+            $this->markExpired($notification);
+            return false;
+        }
+
+        if ($this->shouldWaitForRetry($notification)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    private function isProcessingStillFresh(Notification $notification): bool
+    {
+        if ($notification->status !== 'processing' || !$notification->processing_started_at) {
+            return false;
+        }
+
+        $processingTimeout = (int) config('notifications.retry.processing_timeout_seconds', 300);
+        return $notification->processing_started_at->diffInSeconds(now()) < $processingTimeout;
+    }
+
+    private function isExpired(Notification $notification): bool
+    {
+        $ttlHours = (int) config('notifications.retry.delivery_ttl_hours', 24);
+        return $notification->created_at && $notification->created_at->lt(now()->subHours($ttlHours));
+    }
+
+    private function markExpired(Notification $notification): void
+    {
+        $notification->status = 'failed';
+        $notification->last_error = 'Notification expired before delivery.';
+        $notification->error_type = 'expired';
+        $notification->error_code = 'expired';
+        $notification->save();
+    }
+
+    private function shouldWaitForRetry(Notification $notification): bool
+    {
+        if ($notification->status !== 'retrying' || !$notification->next_retry_at) {
+            return false;
+        }
+
+        if (!$notification->next_retry_at->isFuture()) {
+            return false;
+        }
+
+        $delay = $notification->next_retry_at->diffInSeconds(now());
+        $this->release(max(1, $delay));
+        return true;
     }
 
     private function sendNotification(Notification $notification): void

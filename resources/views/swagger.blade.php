@@ -4,7 +4,9 @@
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <title>Notification API Docs</title>
-        <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5.17.14/swagger-ui.css">
+        <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5.17.14/swagger-ui.css"
+              integrity="sha256-QBcPDuhZ0X+SExunBzKaiKBw5PZodNETZemnfSMvYRc="
+              crossorigin="anonymous">
         <style>
             body { margin: 0; background: #f8fafc; }
             #swagger-ui { max-width: 1100px; margin: 0 auto; }
@@ -68,7 +70,9 @@
             </nav>
         </div>
         <div id="swagger-ui"></div>
-        <script src="https://unpkg.com/swagger-ui-dist@5.17.14/swagger-ui-bundle.js"></script>
+        <script src="https://unpkg.com/swagger-ui-dist@5.17.14/swagger-ui-bundle.js"
+                integrity="sha256-wuSp7wgUSDn/R8FCAgY+z+TlnnCk5xVKJr1Q2IDIi6E="
+                crossorigin="anonymous"></script>
         <script>
             window.onload = () => {
                 SwaggerUIBundle({

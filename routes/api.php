@@ -10,6 +10,8 @@ use Illuminate\Support\Facades\Route;
 
 Route::prefix('v1')->group(function () {
     Route::middleware(['api.key', 'client.rate'])->group(function () {
+        $templateIdPath = 'templates/{templateId}';
+
         Route::get('health', [HealthController::class, 'index']);
         Route::get('metrics', [MetricsController::class, 'index']);
         Route::get('metrics/prometheus', [MetricsController::class, 'prometheus']);
@@ -30,8 +32,8 @@ Route::prefix('v1')->group(function () {
         Route::post('templates', [NotificationTemplateController::class, 'store']);
         Route::get('templates', [NotificationTemplateController::class, 'index']);
         Route::post('templates/preview', TemplatePreviewController::class);
-        Route::get('templates/{templateId}', [NotificationTemplateController::class, 'show']);
-        Route::patch('templates/{templateId}', [NotificationTemplateController::class, 'update']);
-        Route::delete('templates/{templateId}', [NotificationTemplateController::class, 'destroy']);
+        Route::get($templateIdPath, [NotificationTemplateController::class, 'show']);
+        Route::patch($templateIdPath, [NotificationTemplateController::class, 'update']);
+        Route::delete($templateIdPath, [NotificationTemplateController::class, 'destroy']);
     });
 });

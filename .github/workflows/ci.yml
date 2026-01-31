@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [development, release, master]
+  pull_request:
+    branches: [development, release, master]
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: mbstring, pdo_sqlite
+          coverage: none
+
+      - name: Install dependencies
+        run: composer install --no-interaction --prefer-dist
+
+      - name: Prepare environment
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+
+      - name: Run tests
+        env:
+          DB_CONNECTION: sqlite
+          DB_DATABASE: ':memory:'
+        run: php artisan test
+
+  integration:
+    runs-on: ubuntu-latest
+    needs: deploy
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: mbstring, pdo_sqlite
+          coverage: none
+
+      - name: Install dependencies
+        run: composer install --no-interaction --prefer-dist
+
+      - name: Prepare environment
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+
+      - name: Run integration tests
+        env:
+          DB_CONNECTION: sqlite
+          DB_DATABASE: ':memory:'
+          REDIS_HOST: 127.0.0.1
+          REDIS_PORT: 6379
+          INTEGRATION_TESTS: 1
+        run: php artisan test --testsuite=Integration
+
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials (placeholder)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::000000000000:role/placeholder-ci-role
+          aws-region: us-east-1
+
+      - name: Deploy (placeholder)
+        env:
+          AWS_REGION: us-east-1
+          ECS_CLUSTER: placeholder-cluster
+          ECS_SERVICE: placeholder-service
+        run: |
+          echo "Deploying to AWS (placeholder)"
+          echo "Region: $AWS_REGION"
+          echo "Cluster: $ECS_CLUSTER"
+          echo "Service: $ECS_SERVICE"

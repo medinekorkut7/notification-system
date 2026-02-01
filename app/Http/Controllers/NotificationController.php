@@ -5,15 +5,20 @@ namespace App\Http\Controllers;
 use App\Http\Requests\ListNotificationsRequest;
 use App\Http\Requests\StoreNotificationsRequest;
 use App\Jobs\SendNotificationJob;
+use App\Enums\NotificationBatchStatus;
+use App\Enums\NotificationStatus;
 use App\Models\Notification;
 use App\Models\NotificationBatch;
-use App\Models\NotificationTemplate;
+use App\Services\NotificationTemplateCache;
 use App\Services\TemplateRenderer;
 use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Bus;
 use Illuminate\Validation\ValidationException;
 use Illuminate\Http\Exceptions\HttpResponseException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Str;
 
 class NotificationController extends Controller
 {
@@ -22,9 +27,7 @@ class NotificationController extends Controller
         $payload = $request->validated();
         $notificationsData = $payload['notifications'] ?? [];
         $batchData = $payload['batch'] ?? null;
-        $correlationId = $request->attributes->get('correlation_id');
-        $traceId = $request->attributes->get('trace_id');
-        $spanId = $request->attributes->get('span_id');
+        $context = $this->buildRequestContext($request);
 
         $existingBatch = $this->findExistingBatch($batchData);
 
@@ -41,12 +44,14 @@ class NotificationController extends Controller
         $duplicates = 0;
         $results = [];
 
+        // Batch check for existing idempotency keys (single query instead of N)
+        $existingKeys = $this->getExistingIdempotencyKeys($notificationsData);
+
         DB::transaction(function () use (
             $notificationsData,
             $batchData,
-            $correlationId,
-            $traceId,
-            $spanId,
+            $context,
+            $existingKeys,
             &$batch,
             &$created,
             &$duplicates,
@@ -55,46 +60,24 @@ class NotificationController extends Controller
             $batch = $this->createBatchIfNeeded(
                 $batchData,
                 $notificationsData,
-                $correlationId,
-                $traceId,
-                $spanId
+                $context['correlation_id'],
+                $context['trace_id'],
+                $context['span_id']
             );
 
-            $renderer = app(TemplateRenderer::class);
+            $prepared = $this->prepareNotificationsForInsert(
+                $notificationsData,
+                $batch?->id,
+                $existingKeys,
+                $context
+            );
 
-            foreach ($notificationsData as $notificationData) {
-                $idempotencyKey = $notificationData['idempotency_key'] ?? null;
-                $this->ensureNotificationIdempotent($idempotencyKey);
+            $created += $prepared['created'];
+            $duplicates += $prepared['duplicates'];
+            $results = $prepared['results'];
 
-                $priority = $notificationData['priority'] ?? 'normal';
-                $scheduledAt = $this->parseScheduledAt($notificationData);
-                $status = $this->resolveStatus($scheduledAt);
-
-                $content = $this->resolveContent($notificationData, $renderer);
-                $this->assertContentWithinLimits($notificationData['channel'], $content);
-
-                $notification = Notification::create([
-                    'batch_id' => $batch?->id,
-                    'channel' => $notificationData['channel'],
-                    'priority' => $priority,
-                    'recipient' => $notificationData['recipient'],
-                    'content' => $content ?? '',
-                    'status' => $status,
-                    'idempotency_key' => $idempotencyKey,
-                    'correlation_id' => $notificationData['correlation_id'] ?? $correlationId,
-                    'trace_id' => $traceId,
-                    'span_id' => $spanId,
-                    'scheduled_at' => $scheduledAt,
-                ]);
-
-                $created++;
-                $results[] = $this->formatNotification($notification);
-
-                if ($status === 'pending') {
-                    dispatch((new SendNotificationJob($notification->id))
-                        ->onQueue(config('notifications.queue_names.' . $priority, 'notifications-normal')));
-                }
-            }
+            $this->insertNotifications($prepared['insert']);
+            $this->dispatchNotificationJobs($prepared['jobs']);
         });
 
         return response()->json([
@@ -117,7 +100,9 @@ class NotificationController extends Controller
 
     public function showBatch(string $batchId): JsonResponse
     {
-        $batch = NotificationBatch::query()->findOrFail($batchId);
+        $batch = NotificationBatch::query()
+            ->with('notifications')
+            ->findOrFail($batchId);
 
         return response()->json([
             'batch_id' => $batch->id,
@@ -126,7 +111,7 @@ class NotificationController extends Controller
             'trace_id' => $batch->trace_id,
             'span_id' => $batch->span_id,
             'metadata' => $batch->metadata,
-            'notifications' => $batch->notifications()->get()->map(fn (Notification $n) => $this->formatNotification($n)),
+            'notifications' => $batch->notifications->map(fn (Notification $n) => $this->formatNotification($n)),
         ]);
     }
 
@@ -134,14 +119,17 @@ class NotificationController extends Controller
     {
         $notification = Notification::query()->findOrFail($notificationId);
 
-        if (!in_array($notification->status, ['pending', 'scheduled'], true)) {
+        if (!in_array($notification->status, [
+            NotificationStatus::Pending->value,
+            NotificationStatus::Scheduled->value,
+        ], true)) {
             return response()->json([
                 'message' => 'Notification cannot be cancelled.',
                 'status' => $notification->status,
             ], 409);
         }
 
-        $notification->status = 'cancelled';
+        $notification->status = NotificationStatus::Cancelled->value;
         $notification->cancelled_at = now();
         $notification->save();
 
@@ -156,13 +144,17 @@ class NotificationController extends Controller
         $batch = NotificationBatch::query()->findOrFail($batchId);
 
         $cancelled = $batch->notifications()
-            ->whereIn('status', ['pending', 'scheduled', 'retrying'])
+            ->whereIn('status', [
+                NotificationStatus::Pending->value,
+                NotificationStatus::Scheduled->value,
+                NotificationStatus::Retrying->value,
+            ])
             ->update([
-                'status' => 'cancelled',
+                'status' => NotificationStatus::Cancelled->value,
                 'cancelled_at' => now(),
             ]);
 
-        $batch->status = 'cancelled';
+        $batch->status = NotificationBatchStatus::Cancelled->value;
         $batch->save();
 
         return response()->json([
@@ -270,28 +262,175 @@ class NotificationController extends Controller
             'correlation_id' => $batchData['correlation_id'] ?? $correlationId,
             'trace_id' => $traceId,
             'span_id' => $spanId,
-            'status' => 'pending',
+            'status' => NotificationBatchStatus::Pending->value,
             'total_count' => count($notificationsData),
             'metadata' => $metadata,
         ]);
     }
 
-    private function ensureNotificationIdempotent(?string $idempotencyKey): void
+    /**
+     * Check duplicates in batch - single query instead of N queries.
+     *
+     * @param array $notificationsData
+     * @return array<string, bool> Map of idempotency_key => exists
+     */
+    private function getExistingIdempotencyKeys(array $notificationsData): array
+    {
+        $keys = array_filter(
+            array_column($notificationsData, 'idempotency_key'),
+            fn ($key) => $key !== null
+        );
+
+        if (empty($keys)) {
+            return [];
+        }
+
+        return Notification::query()
+            ->whereIn('idempotency_key', $keys)
+            ->pluck('idempotency_key')
+            ->flip()
+            ->map(fn () => true)
+            ->toArray();
+    }
+
+    /**
+     * @return array{correlation_id: string|null, trace_id: string|null, span_id: string|null}
+     */
+    private function buildRequestContext(Request $request): array
+    {
+        return [
+            'correlation_id' => $request->attributes->get('correlation_id'),
+            'trace_id' => $request->attributes->get('trace_id'),
+            'span_id' => $request->attributes->get('span_id'),
+        ];
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $notificationsData
+     * @param array<string, bool> $existingKeys
+     * @param array{correlation_id: string|null, trace_id: string|null, span_id: string|null} $context
+     * @return array{
+     *   insert: array<int, array<string, mixed>>,
+     *   jobs: array<int, array{id: string, priority: string}>,
+     *   results: array<int, array<string, mixed>>,
+     *   created: int,
+     *   duplicates: int
+     * }
+     */
+    private function prepareNotificationsForInsert(
+        array $notificationsData,
+        ?string $batchId,
+        array $existingKeys,
+        array $context
+    ): array {
+        $renderer = app(TemplateRenderer::class);
+        $notificationsToInsert = [];
+        $jobsToDispatch = [];
+        $results = [];
+        $created = 0;
+        $duplicates = 0;
+        $now = now();
+
+        foreach ($notificationsData as $notificationData) {
+            $idempotencyKey = $notificationData['idempotency_key'] ?? null;
+            if ($this->isDuplicateNotification($idempotencyKey, $existingKeys, $duplicates)) {
+                continue;
+            }
+
+            $priority = $notificationData['priority'] ?? 'normal';
+            $scheduledAt = $this->parseScheduledAt($notificationData);
+            $status = $this->resolveStatus($scheduledAt);
+
+            $content = $this->resolveContent($notificationData, $renderer);
+            $this->assertContentWithinLimits($notificationData['channel'], $content);
+
+            $notificationId = (string) Str::uuid();
+            $notificationsToInsert[] = [
+                'id' => $notificationId,
+                'batch_id' => $batchId,
+                'channel' => $notificationData['channel'],
+                'priority' => $priority,
+                'recipient' => $notificationData['recipient'],
+                'content' => $content ?? '',
+                'status' => $status,
+                'idempotency_key' => $idempotencyKey,
+                'correlation_id' => $notificationData['correlation_id'] ?? $context['correlation_id'],
+                'trace_id' => $context['trace_id'],
+                'span_id' => $context['span_id'],
+                'scheduled_at' => $scheduledAt,
+                'created_at' => $now,
+                'updated_at' => $now,
+            ];
+
+            $results[] = [
+                'id' => $notificationId,
+                'batch_id' => $batchId,
+                'recipient' => $notificationData['recipient'],
+                'channel' => $notificationData['channel'],
+                'priority' => $priority,
+                'content' => $content ?? '',
+                'status' => $status,
+                'attempts' => 0,
+                'scheduled_at' => $scheduledAt?->toIso8601String(),
+                'sent_at' => null,
+                'cancelled_at' => null,
+                'provider_message_id' => null,
+                'last_error' => null,
+                'created_at' => $now->toIso8601String(),
+            ];
+
+            if ($status === NotificationStatus::Pending->value) {
+                $jobsToDispatch[] = [
+                    'id' => $notificationId,
+                    'priority' => $priority,
+                ];
+            }
+
+            $created++;
+        }
+
+        return [
+            'insert' => $notificationsToInsert,
+            'jobs' => $jobsToDispatch,
+            'results' => $results,
+            'created' => $created,
+            'duplicates' => $duplicates,
+        ];
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $notificationsToInsert
+     */
+    private function insertNotifications(array $notificationsToInsert): void
+    {
+        foreach (array_chunk($notificationsToInsert, 100) as $chunk) {
+            Notification::insert($chunk);
+        }
+    }
+
+    /**
+     * @param array<int, array{id: string, priority: string}> $jobsToDispatch
+     */
+    private function dispatchNotificationJobs(array $jobsToDispatch): void
+    {
+        foreach ($jobsToDispatch as $job) {
+            dispatch((new SendNotificationJob($job['id']))
+                ->onQueue(config('notifications.queue_names.' . $job['priority'], 'notifications-normal')));
+        }
+    }
+
+    private function isDuplicateNotification(?string $idempotencyKey, array $existingKeys, int &$duplicates): bool
     {
         if (!$idempotencyKey) {
-            return;
+            return false;
         }
 
-        $existing = Notification::query()->where('idempotency_key', $idempotencyKey)->first();
-        if (!$existing) {
-            return;
+        if (!isset($existingKeys[$idempotencyKey])) {
+            return false;
         }
 
-        throw new HttpResponseException(response()->json([
-            'message' => 'Notification idempotency key already exists.',
-            'idempotency_key' => $idempotencyKey,
-            'notification_id' => $existing->id,
-        ], 409));
+        $duplicates++;
+        return true;
     }
 
     private function parseScheduledAt(array $notificationData): ?Carbon
@@ -303,7 +442,9 @@ class NotificationController extends Controller
 
     private function resolveStatus(?Carbon $scheduledAt): string
     {
-        return $scheduledAt && $scheduledAt->isFuture() ? 'scheduled' : 'pending';
+        return $scheduledAt && $scheduledAt->isFuture()
+            ? NotificationStatus::Scheduled->value
+            : NotificationStatus::Pending->value;
     }
 
     private function resolveContent(array $notificationData, TemplateRenderer $renderer): ?string
@@ -313,7 +454,7 @@ class NotificationController extends Controller
             return $content;
         }
 
-        $template = NotificationTemplate::query()->findOrFail($notificationData['template_id']);
+        $template = app(NotificationTemplateCache::class)->getOrFail($notificationData['template_id']);
         $variables = array_merge(
             $template->default_variables ?? [],
             $notificationData['variables'] ?? []

@@ -12,9 +12,14 @@ use Illuminate\Support\Facades\Redis;
 
 class MetricsController extends Controller
 {
+    /**
+     * Cache TTL in seconds for metrics.
+     */
+    private const METRICS_CACHE_TTL = 30;
+
     public function index(): JsonResponse
     {
-        $metrics = $this->gatherMetrics();
+        $metrics = $this->getCachedMetrics();
 
         return response()->json([
             'queues' => $metrics['queues'],
@@ -27,7 +32,7 @@ class MetricsController extends Controller
 
     public function prometheus(): Response
     {
-        $metrics = $this->gatherMetrics();
+        $metrics = $this->getCachedMetrics();
 
         $lines = [];
         $lines[] = '# HELP notification_queue_depth Number of jobs waiting in each queue.';
@@ -71,13 +76,29 @@ class MetricsController extends Controller
     /**
      * @return array<string, mixed>
      */
+    private function getCachedMetrics(): array
+    {
+        return cache()->remember('metrics:all', self::METRICS_CACHE_TTL, fn() => $this->gatherMetrics());
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
     private function gatherMetrics(): array
     {
+        // Cache queue names config
+        $queueNames = [
+            'high' => config('notifications.queue_names.high'),
+            'normal' => config('notifications.queue_names.normal'),
+            'low' => config('notifications.queue_names.low'),
+            'dead' => config('notifications.queue_names.dead'),
+        ];
+
         $queues = [
-            'high' => Queue::size(config('notifications.queue_names.high')),
-            'normal' => Queue::size(config('notifications.queue_names.normal')),
-            'low' => Queue::size(config('notifications.queue_names.low')),
-            'dead' => Queue::size(config('notifications.queue_names.dead')),
+            'high' => Queue::size($queueNames['high']),
+            'normal' => Queue::size($queueNames['normal']),
+            'low' => Queue::size($queueNames['low']),
+            'dead' => Queue::size($queueNames['dead']),
         ];
 
         $statusCounts = Notification::query()
@@ -88,14 +109,28 @@ class MetricsController extends Controller
 
         $deadCount = DeadLetterNotification::query()->count();
 
+        // Use Redis pipeline for circuit breaker status checks
         $channels = config('notifications.channels');
+        $breakerKeys = array_map(fn($ch) => "notifications:circuit:open:{$ch}", $channels);
+        
         $breakerStatus = [];
-        foreach ($channels as $channel) {
-            $breakerStatus[$channel] = Redis::exists("notifications:circuit:open:{$channel}") ? 'open' : 'closed';
+        if (!empty($breakerKeys)) {
+            $results = Redis::pipeline(function ($pipe) use ($breakerKeys) {
+                foreach ($breakerKeys as $key) {
+                    $pipe->exists($key);
+                }
+            });
+            
+            foreach ($channels as $i => $channel) {
+                $breakerStatus[$channel] = ($results[$i] ?? false) ? 'open' : 'closed';
+            }
         }
 
+        // Limit latency calculation to last 24 hours for performance
         $driver = DB::getDriverName();
-        $latencyQuery = Notification::query()->whereNotNull('sent_at');
+        $latencyQuery = Notification::query()
+            ->whereNotNull('sent_at')
+            ->where('sent_at', '>=', now()->subHours(24));
 
         if ($driver === 'sqlite') {
             $avgLatency = $latencyQuery

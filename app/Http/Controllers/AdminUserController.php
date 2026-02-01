@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Http\Controllers\Traits\ChecksAdminRole;
 use App\Models\AdminUser;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
@@ -10,6 +11,8 @@ use App\Services\AdminAuditLogger;
 
 class AdminUserController extends Controller
 {
+    use ChecksAdminRole;
+
     private const USERS_ROUTE = '/admin/users';
 
     public function index()
@@ -101,16 +104,5 @@ class AdminUserController extends Controller
         ]);
 
         return redirect(self::USERS_ROUTE)->with('status', 'Admin user removed.');
-    }
-
-    private function isAdmin(Request $request): bool
-    {
-        $adminUserId = $request->session()->get('admin_user_id');
-        if (!$adminUserId) {
-            return false;
-        }
-
-        $admin = AdminUser::query()->find($adminUserId);
-        return $admin?->role === 'admin';
     }
 }

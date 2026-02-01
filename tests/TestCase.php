@@ -16,11 +16,13 @@ abstract class TestCase extends BaseTestCase
             $this->withHeaders(['X-Api-Key' => $apiKey]);
         }
 
-        if (!class_exists('Redis')) {
-            Redis::shouldReceive('incr')->andReturn(1)->byDefault();
-            Redis::shouldReceive('expire')->andReturn(true)->byDefault();
-            Redis::shouldReceive('exists')->andReturn(0)->byDefault();
-            Redis::shouldReceive('ping')->andReturn('PONG')->byDefault();
-        }
+        Redis::shouldReceive('eval')->andReturn(1)->byDefault();
+        Redis::shouldReceive('incr')->andReturn(1)->byDefault();
+        Redis::shouldReceive('expire')->andReturn(true)->byDefault();
+        Redis::shouldReceive('exists')->andReturn(0)->byDefault();
+        Redis::shouldReceive('ping')->andReturn('PONG')->byDefault();
+        Redis::shouldReceive('set')->andReturn(true)->byDefault();
+        Redis::shouldReceive('get')->andReturn(null)->byDefault();
+        Redis::shouldReceive('del')->andReturn(1)->byDefault();
     }
 }

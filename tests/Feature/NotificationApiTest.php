@@ -6,6 +6,7 @@ use App\Jobs\SendNotificationJob;
 use App\Jobs\DeadLetterNotificationJob;
 use App\Models\Notification;
 use App\Models\DeadLetterNotification;
+use App\Models\NotificationBatch;
 use App\Models\NotificationTemplate;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Queue;
@@ -13,6 +14,7 @@ use Illuminate\Support\Facades\Redis;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Event;
 use App\Events\NotificationStatusUpdated;
+use Mockery;
 use Tests\TestCase;
 
 class NotificationApiTest extends TestCase
@@ -147,6 +149,49 @@ class NotificationApiTest extends TestCase
             ->assertJsonFragment(['duplicates' => 1]);
     }
 
+    public function test_it_rejects_duplicate_batch_idempotency_key(): void
+    {
+        Queue::fake();
+
+        $batch = NotificationBatch::create([
+            'idempotency_key' => 'batch-dup-1',
+            'status' => 'pending',
+            'total_count' => 1,
+        ]);
+
+        Notification::create([
+            'batch_id' => $batch->id,
+            'channel' => 'sms',
+            'priority' => 'normal',
+            'recipient' => '+905551234567',
+            'content' => 'Duplicate batch payload',
+            'status' => 'pending',
+        ]);
+
+        $payload = [
+            'batch' => [
+                'idempotency_key' => 'batch-dup-1',
+            ],
+            'notifications' => [
+                [
+                    'recipient' => '+905551234567',
+                    'channel' => 'sms',
+                    'content' => 'Should be rejected',
+                ],
+            ],
+        ];
+
+        $this->postJson('/api/v1/notifications', $payload)
+            ->assertStatus(409)
+            ->assertJsonFragment([
+                'batch_id' => $batch->id,
+                'duplicates' => 1,
+            ]);
+
+        // Verify no notification jobs were dispatched (UpdateBatchStatusJob from setup is expected)
+        Queue::assertNotPushed(SendNotificationJob::class);
+    }
+
     public function test_it_can_query_by_notification_and_batch_id(): void
     {
         Queue::fake();
@@ -220,6 +265,148 @@ class NotificationApiTest extends TestCase
             ]);
     }
 
+    public function test_it_rejects_cancelling_sent_notifications(): void
+    {
+        $notification = Notification::create([
+            'channel' => 'sms',
+            'priority' => 'normal',
+            'recipient' => '+905551234567',
+            'content' => 'Already sent',
+            'status' => 'sent',
+            'sent_at' => now(),
+        ]);
+
+        $this->postJson("/api/v1/notifications/{$notification->id}/cancel")
+            ->assertStatus(409)
+            ->assertJsonFragment([
+                'message' => 'Notification cannot be cancelled.',
+                'status' => 'sent',
+            ]);
+    }
+
+    public function test_it_cancels_batch_pending_and_retrying_notifications(): void
+    {
+        $batch = NotificationBatch::create([
+            'idempotency_key' => 'batch-cancel-1',
+            'status' => 'pending',
+            'total_count' => 3,
+        ]);
+
+        $pending = Notification::create([
+            'batch_id' => $batch->id,
+            'channel' => 'sms',
+            'priority' => 'normal',
+            'recipient' => '+905551234567',
+            'content' => 'Pending',
+            'status' => 'pending',
+        ]);
+
+        $sent = Notification::create([
+            'batch_id' => $batch->id,
+            'channel' => 'email',
+            'priority' => 'normal',
+            'recipient' => 'user@example.com',
+            'content' => 'Sent',
+            'status' => 'sent',
+            'sent_at' => now(),
+        ]);
+
+        $retrying = Notification::create([
+            'batch_id' => $batch->id,
+            'channel' => 'sms',
+            'priority' => 'high',
+            'recipient' => '+905551234567',
+            'content' => 'Retrying',
+            'status' => 'retrying',
+        ]);
+
+        $this->postJson("/api/v1/batches/{$batch->id}/cancel")
+            ->assertStatus(200)
+            ->assertJsonFragment([
+                'batch_id' => $batch->id,
+                'cancelled_count' => 2,
+            ]);
+
+        $pending->refresh();
+        $sent->refresh();
+        $retrying->refresh();
+
+        $this->assertSame('cancelled', $pending->status);
+        $this->assertSame('sent', $sent->status);
+        $this->assertSame('cancelled', $retrying->status);
+    }
+
+    public function test_it_filters_notifications_by_status_priority_and_batch(): void
+    {
+        $batch = NotificationBatch::create([
+            'idempotency_key' => 'batch-filter-1',
+            'status' => 'pending',
+            'total_count' => 2,
+        ]);
+
+        $match = Notification::create([
+            'batch_id' => $batch->id,
+            'channel' => 'sms',
+            'priority' => 'high',
+            'recipient' => '+905551234567',
+            'content' => 'Match',
+            'status' => 'sent',
+        ]);
+        $match->created_at = now()->subMinutes(10);
+        $match->sent_at = now();
+        $match->save();
+
+        Notification::create([
+            'batch_id' => $batch->id,
+            'channel' => 'sms',
+            'priority' => 'low',
+            'recipient' => '+905551234567',
+            'content' => 'Nope',
+            'status' => 'sent',
+        ]);
+
+        $response = $this->getJson('/api/v1/notifications', [
+            'status' => 'sent',
+            'priority' => 'high',
+            'batch_id' => $batch->id,
+        ]);
+
+        $response->assertStatus(200)
+            ->assertJsonFragment(['id' => $match->id]);
+    }
+
+    public function test_it_returns_batch_details_with_notifications(): void
+    {
+        $batch = NotificationBatch::create([
+            'idempotency_key' => 'batch-show-1',
+            'status' => 'pending',
+            'total_count' => 2,
+        ]);
+
+        Notification::create([
+            'batch_id' => $batch->id,
+            'channel' => 'sms',
+            'priority' => 'normal',
+            'recipient' => '+905551234567',
+            'content' => 'First',
+            'status' => 'pending',
+        ]);
+
+        Notification::create([
+            'batch_id' => $batch->id,
+            'channel' => 'email',
+            'priority' => 'low',
+            'recipient' => 'user@example.com',
+            'content' => 'Second',
+            'status' => 'pending',
+        ]);
+
+        $this->getJson("/api/v1/batches/{$batch->id}")
+            ->assertStatus(200)
+            ->assertJsonFragment(['batch_id' => $batch->id])
+            ->assertJsonFragment(['total_count' => 2]);
+    }
+
     public function test_it_lists_notifications_with_filters_and_pagination(): void
     {
         Queue::fake();
@@ -281,6 +468,32 @@ class NotificationApiTest extends TestCase
             ->assertJsonFragment(['content' => 'Hello Ada']);
     }
 
+    public function test_it_rejects_rendered_content_over_limit(): void
+    {
+        Queue::fake();
+
+        $template = NotificationTemplate::create([
+            'name' => 'long-sms',
+            'channel' => 'sms',
+            'content' => str_repeat('a', 200),
+            'default_variables' => [],
+        ]);
+
+        $payload = [
+            'notifications' => [
+                [
+                    'recipient' => '+905551234567',
+                    'channel' => 'sms',
+                    'template_id' => $template->id,
+                ],
+            ],
+        ];
+
+        $this->postJson('/api/v1/notifications', $payload)
+            ->assertStatus(422)
+            ->assertJsonValidationErrors(['notifications']);
+    }
+
     public function test_templates_can_be_updated_and_deleted(): void
     {
         $template = NotificationTemplate::create([
@@ -333,7 +546,13 @@ class NotificationApiTest extends TestCase
     public function test_metrics_endpoint_returns_expected_shape(): void
     {
         Redis::shouldReceive('ping')->andReturn('PONG');
-        Redis::shouldReceive('exists')->andReturn(0);
+        // Mock Redis pipeline for circuit breaker status checks
+        Redis::shouldReceive('pipeline')->andReturnUsing(function ($callback) {
+            $pipe = Mockery::mock();
+            $pipe->shouldReceive('exists')->andReturnSelf();
+            $callback($pipe);
+            return [0, 0, 0]; // All circuit breakers closed
+        });
         Queue::shouldReceive('size')->andReturn(0);
 
         $notification = Notification::create([
@@ -360,7 +579,13 @@ class NotificationApiTest extends TestCase
 
     public function test_prometheus_metrics_endpoint_returns_text_format(): void
     {
-        Redis::shouldReceive('exists')->andReturn(0);
+        // Mock Redis pipeline for circuit breaker status checks
+        Redis::shouldReceive('pipeline')->andReturnUsing(function ($callback) {
+            $pipe = Mockery::mock();
+            $pipe->shouldReceive('exists')->andReturnSelf();
+            $callback($pipe);
+            return [0, 0, 0]; // All circuit breakers closed
+        });
         Queue::shouldReceive('size')->andReturn(0);
 
         $response = $this->get('/api/v1/metrics/prometheus');
@@ -383,8 +608,7 @@ class NotificationApiTest extends TestCase
     public function test_client_rate_limit_blocks_requests(): void
     {
         config(['notifications.rate_limits.per_client_per_minute' => 1]);
-        Redis::shouldReceive('incr')->once()->andReturn(2);
-        Redis::shouldReceive('expire')->never();
+        Redis::shouldReceive('eval')->once()->andReturn(2);
 
         $response = $this->getJson('/api/v1/metrics');
 

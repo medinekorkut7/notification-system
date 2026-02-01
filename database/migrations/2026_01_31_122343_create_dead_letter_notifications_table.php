@@ -23,6 +23,10 @@ return new class extends Migration
             $table->json('payload')->nullable();
             $table->json('last_response')->nullable();
             $table->timestamps();
+            $table->index(['recipient', 'channel'], 'dead_letter_recipient_channel_idx');
+            $table->index(['created_at'], 'dead_letter_created_at_idx');
+            $table->index(['channel', 'created_at'], 'dead_letter_channel_created_at_idx');
+            $table->index(['error_code'], 'dead_letter_error_code_idx');
         });
     }
 

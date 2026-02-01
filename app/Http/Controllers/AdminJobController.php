@@ -7,16 +7,19 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Redis;
 use App\Models\DeadLetterNotification;
-use App\Models\Notification;
-use App\Jobs\SendNotificationJob;
-use Illuminate\Support\Str;
 use App\Services\AdminAuditLogger;
+use App\Services\DeadLetterRequeueService;
+use Symfony\Component\Process\Process;
 
 class AdminJobController extends Controller
 {
     private const PAUSE_KEY = 'notifications:processing:paused';
     private const WORKER_GROUP = 'notifications-workers';
     private const STRESS_KEY = 'notifications:stress:last';
+
+    public function __construct(
+        private readonly DeadLetterRequeueService $requeueService
+    ) {}
 
     public function status(): JsonResponse
     {
@@ -156,44 +159,29 @@ class AdminJobController extends Controller
         $delay = max(0, (int) $request->input('delay_seconds', 0));
         $priority = (string) $request->input('priority', 'normal');
 
-        if (!in_array($priority, ['high', 'normal', 'low'], true)) {
+        if (!$this->requeueService->isValidPriority($priority)) {
             return response()->json([
                 'message' => 'Invalid priority.',
             ], 422);
         }
 
-        $query = DeadLetterNotification::query()->orderBy('created_at');
-        if ($channel !== '') {
-            $query->where('channel', $channel);
-        }
-
-        $items = $query->limit($limit)->get();
-        $requeued = 0;
-        $skipped = 0;
-
-        foreach ($items as $item) {
-            $result = $this->requeueItem($item, $delay, $priority);
-            if ($result['ok']) {
-                $requeued++;
-            } else {
-                $skipped++;
-            }
-        }
+        $items = $this->requeueService->queryForRequeue($limit, $channel);
+        $result = $this->requeueService->requeueBatch($items, $delay, $priority);
 
         app(AdminAuditLogger::class)->log($request, 'admin.dead_letter_requeue_bulk', [
             'limit' => $limit,
             'channel' => $channel,
             'delay_seconds' => $delay,
             'priority' => $priority,
-            'requeued' => $requeued,
-            'skipped' => $skipped,
+            'requeued' => $result['requeued'],
+            'skipped' => $result['skipped'],
         ]);
 
         return response()->json([
             'message' => 'Dead-letter requeue completed.',
             'requested' => $limit,
-            'requeued' => $requeued,
-            'skipped' => $skipped,
+            'requeued' => $result['requeued'],
+            'skipped' => $result['skipped'],
         ]);
     }
 
@@ -203,13 +191,13 @@ class AdminJobController extends Controller
         $delay = max(0, (int) $request->input('delay_seconds', 0));
         $priority = (string) $request->input('priority', 'normal');
 
-        if (!in_array($priority, ['high', 'normal', 'low'], true)) {
+        if (!$this->requeueService->isValidPriority($priority)) {
             return response()->json([
                 'message' => 'Invalid priority.',
             ], 422);
         }
 
-        $result = $this->requeueItem($item, $delay, $priority);
+        $result = $this->requeueService->requeueSingle($item, $delay, $priority);
 
         if (!$result['ok']) {
             return response()->json([
@@ -288,60 +276,28 @@ class AdminJobController extends Controller
         }
 
         $command = array_merge($command, $args);
-        $escaped = array_map('escapeshellarg', $command);
-        $fullCommand = implode(' ', $escaped);
 
-        $output = [];
-        $exitCode = 0;
-        @exec($fullCommand . ' 2>&1', $output, $exitCode);
+        // Use Symfony Process to avoid shell injection vulnerabilities
+        // Process executes commands directly without shell interpretation
+        $process = new Process($command);
+        $process->setTimeout(30);
+
+        try {
+            $process->run();
+        } catch (\Throwable $e) {
+            return [
+                'exit_code' => 1,
+                'lines' => ['Process execution failed: ' . $e->getMessage()],
+            ];
+        }
+
+        $output = $process->getOutput() . $process->getErrorOutput();
+        $lines = array_filter(explode("\n", trim($output)), fn ($line) => $line !== '');
 
         return [
-            'exit_code' => $exitCode,
-            'lines' => $output,
+            'exit_code' => $process->getExitCode() ?? 0,
+            'lines' => array_values($lines),
         ];
-    }
-
-    /**
-     * @return array{ok: bool, notification_id?: string, message?: string}
-     */
-    private function requeueItem(DeadLetterNotification $item, int $delaySeconds = 0, string $priority = 'normal'): array
-    {
-        $payload = is_array($item->payload) ? $item->payload : [];
-
-        $recipient = $payload['to'] ?? $item->recipient;
-        $channel = $payload['channel'] ?? $item->channel;
-        $content = $payload['content'] ?? '';
-
-        if (!$recipient || !$channel) {
-            return ['ok' => false, 'message' => 'Dead-letter item is missing recipient or channel.'];
-        }
-
-        $idempotencyKey = $payload['idempotency_key'] ?? null;
-        if ($idempotencyKey) {
-            $idempotencyKey = $idempotencyKey . '-requeue-' . Str::uuid();
-        }
-
-        $notification = Notification::query()->create([
-            'batch_id' => null,
-            'channel' => $channel,
-            'priority' => $priority,
-            'recipient' => $recipient,
-            'content' => $content,
-            'status' => 'pending',
-            'idempotency_key' => $idempotencyKey,
-            'correlation_id' => (string) Str::uuid(),
-            'attempts' => 0,
-            'max_attempts' => 5,
-        ]);
-
-        $queue = config('notifications.queue_names.' . $priority, 'notifications-normal');
-        $job = (new SendNotificationJob($notification->id))->onQueue($queue);
-        if ($delaySeconds > 0) {
-            $job->delay($delaySeconds);
-        }
-        dispatch($job);
-
-        return ['ok' => true, 'notification_id' => $notification->id];
     }
 
     /**

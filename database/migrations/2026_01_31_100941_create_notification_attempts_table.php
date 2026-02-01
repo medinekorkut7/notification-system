@@ -21,7 +21,8 @@ return new class extends Migration
             $table->text('error_message')->nullable();
             $table->unsignedInteger('duration_ms')->nullable();
             $table->timestamps();
-
+            $table->index(['status'], 'notification_attempts_status_idx');
+            $table->index(['status', 'created_at'], 'notification_attempts_status_created_at_idx');
             $table->foreign('notification_id')->references('id')->on('notifications')->cascadeOnDelete();
         });
     }

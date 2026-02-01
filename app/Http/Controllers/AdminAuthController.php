@@ -25,10 +25,16 @@ class AdminAuthController extends Controller
             ->where('email', $credentials['email'])
             ->first();
 
-        if (!$user || !$user->is_active || !Hash::check($credentials['password'], $user->password)) {
+        // Always perform password check to prevent timing attacks (constant-time comparison)
+        // Use a dummy hash if user doesn't exist to ensure consistent timing
+        $dummyHash = '$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi';
+        $passwordToCheck = $user?->password ?? $dummyHash;
+        $passwordValid = Hash::check($credentials['password'], $passwordToCheck);
+
+        if (!$user || !$user->is_active || !$passwordValid) {
+            // Don't reveal specific failure reason in audit logs to prevent information disclosure
             app(AdminAuditLogger::class)->log($request, 'admin.login_failed', [
                 'email' => $credentials['email'],
-                'reason' => $user ? ($user->is_active ? 'invalid_password' : 'inactive') : 'not_found',
             ]);
             return back()
                 ->withErrors(['email' => 'Invalid credentials or account disabled.'])

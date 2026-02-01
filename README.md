@@ -117,11 +117,17 @@ Supervisor-managed workers are bundled in the Docker image. Use the Admin panel 
 
 ### Admin Panel Overview
 - **API Key Setup**: store the `X-Api-Key` used by panel actions.
+![apiKey_setup.png](docs/images/apiKey_setup.png)
 - **Provider Settings**: set the primary and fallback webhook URLs (overrides `.env` at runtime).
+![provider_settings.png](docs/images/provider_settings.png)
 - **Worker Control**: pause/resume processing, start/stop workers, and restart workers.
+![worker_control.png](docs/images/worker_control.png)
 - **Stress Test**: generate load for local testing.
+![stress_test.png](docs/images/stress_test.png)
 - **Failure Analytics**: view top error codes and permanent failure breakdowns.
+![failure_analytics.png](docs/images/failure_analytics.png)
 - **Admin Users**: manage who can access the panel.
+![admin_users.png](docs/images/admin_users.png)
 
 Admin UI uses its own `admin_users` table. Create the first admin with:
 ```bash
@@ -147,6 +153,48 @@ ADMIN_SEED_NAME=Admin
 ADMIN_SEED_EMAIL=admin@example.com
 ADMIN_SEED_PASSWORD=changeme
 ```
+
+## SonarQube (Code Quality)
+Run SonarQube locally and publish coverage from PHPUnit.
+
+1) Start SonarQube (runs on port 9001):
+```bash
+docker compose -f docker-compose.sonar.yml up -d
+```
+
+2) Open the UI:
+```
+http://localhost:9001
+```
+Default credentials: `admin` / `admin` (you will be prompted to change this).
+
+3) Create a project + token in the UI, then export your token:
+```bash
+export SONAR_TOKEN="your_token_here"
+```
+
+4) Generate coverage (requires Xdebug). If you don’t have Xdebug locally, use Docker:
+```bash
+docker run --rm -v "$(pwd):/app" -w /app php:8.4-cli bash -lc "apt-get update && apt-get install -y --no-install-recommends autoconf g++ make pkg-config && pecl install xdebug && docker-php-ext-enable xdebug && XDEBUG_MODE=coverage vendor/bin/phpunit --coverage-clover storage/coverage.xml"
+```
+
+5) Run the scanner:
+```bash
+sonar-scanner \
+  -Dsonar.host.url=http://localhost:9001 \
+  -Dsonar.projectKey=notification_system \
+  -Dsonar.projectName=notification_system \
+  -Dsonar.sources=app,config,resources,routes \
+  -Dsonar.tests=tests \
+  -Dsonar.exclusions=vendor/**,storage/**,public/build/**,public/hot,bootstrap/cache/**,node_modules/** \
+  -Dsonar.php.file.suffixes=.php \
+  -Dsonar.php.coverage.reportPaths=storage/coverage.xml
+```
+
+Notes:
+- If you see “Missing blame information”, commit your files and re-run the scan so Git can provide blame data.
+- If you see `baseline-browser-mapping` warnings, run:
+  `npm i baseline-browser-mapping@latest -D`
 
 ## API Examples
 Create batch notifications:

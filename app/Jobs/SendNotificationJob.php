@@ -5,6 +5,8 @@ namespace App\Jobs;
 use App\Models\Notification;
 use App\Models\NotificationAttempt;
 use App\Jobs\DeadLetterNotificationJob;
+use App\Enums\NotificationAttemptStatus;
+use App\Enums\NotificationStatus;
 use App\Services\CircuitBreaker;
 use App\Services\ErrorClassifier;
 use App\Services\NotificationProvider;
@@ -13,6 +15,7 @@ use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Queue\Queueable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Redis;
 use Illuminate\Support\Str;
@@ -23,19 +26,27 @@ class SendNotificationJob implements ShouldQueue
 
     public int $tries = 5;
 
+    /**
+     * Cached config value to avoid repeated lookups.
+     */
+    private int $rateLimit;
+
     public function __construct(public string $notificationId)
     {
     }
 
     public function handle(): void
     {
+        // Cache config value once
+        $this->rateLimit = (int) config('notifications.rate_limits.per_channel_per_second', 100);
+
+        // Early exit check
         if ($this->isProcessingPaused()) {
             $this->release(10);
             return;
         }
 
         $notification = Notification::query()->find($this->notificationId);
-
         if (!$notification) {
             return;
         }
@@ -44,28 +55,28 @@ class SendNotificationJob implements ShouldQueue
             return;
         }
 
-        $notification->status = 'processing';
+        $notification->status = NotificationStatus::Processing->value;
         $notification->processing_started_at = $notification->processing_started_at ?? now();
         $notification->save();
 
         Log::withContext(['correlation_id' => $notification->correlation_id]);
 
         $channel = $notification->channel;
-        $limit = config('notifications.rate_limits.per_channel_per_second');
         $breaker = app(CircuitBreaker::class);
         $retryPolicy = app(RetryPolicy::class);
 
         if (!$breaker->allow($channel)) {
-            $notification->status = 'retrying';
+            $openDelay = $retryPolicy->circuitBreakerOpenDelay();
+            $notification->status = NotificationStatus::Retrying->value;
             $notification->last_retry_at = now();
-            $notification->next_retry_at = now()->addSeconds($retryPolicy->circuitBreakerOpenDelay());
+            $notification->next_retry_at = now()->addSeconds($openDelay);
             $notification->save();
-            $this->release($retryPolicy->circuitBreakerOpenDelay());
+            $this->release($openDelay);
             return;
         }
 
         Redis::throttle("notifications:channel:{$channel}")
-            ->allow($limit)
+            ->allow($this->rateLimit)
             ->every(1)
             ->then(function () use ($notification) {
                 $this->sendNotification($notification);
@@ -85,7 +96,11 @@ class SendNotificationJob implements ShouldQueue
 
     private function shouldProcess(Notification $notification): bool
     {
-        if (in_array($notification->status, ['sent', 'failed', 'cancelled'], true)) {
+        if (in_array($notification->status, [
+            NotificationStatus::Sent->value,
+            NotificationStatus::Failed->value,
+            NotificationStatus::Cancelled->value,
+        ], true)) {
             return false;
         }
 
@@ -112,7 +127,7 @@ class SendNotificationJob implements ShouldQueue
 
     private function isProcessingStillFresh(Notification $notification): bool
     {
-        if ($notification->status !== 'processing' || !$notification->processing_started_at) {
+        if ($notification->status !== NotificationStatus::Processing->value || !$notification->processing_started_at) {
             return false;
         }
 
@@ -128,7 +143,7 @@ class SendNotificationJob implements ShouldQueue
 
     private function markExpired(Notification $notification): void
     {
-        $notification->status = 'failed';
+        $notification->status = NotificationStatus::Failed->value;
         $notification->last_error = 'Notification expired before delivery.';
         $notification->error_type = 'expired';
         $notification->error_code = 'expired';
@@ -137,7 +152,7 @@ class SendNotificationJob implements ShouldQueue
 
     private function shouldWaitForRetry(Notification $notification): bool
     {
-        if ($notification->status !== 'retrying' || !$notification->next_retry_at) {
+        if ($notification->status !== NotificationStatus::Retrying->value || !$notification->next_retry_at) {
             return false;
         }
 
@@ -168,7 +183,7 @@ class SendNotificationJob implements ShouldQueue
         $attempt = NotificationAttempt::create([
             'notification_id' => $notification->id,
             'attempt_number' => $attemptNumber,
-            'status' => 'sending',
+            'status' => NotificationAttemptStatus::Sending->value,
             'request_payload' => $payload,
         ]);
 
@@ -182,22 +197,24 @@ class SendNotificationJob implements ShouldQueue
 
             $breaker->recordSuccess($notification->channel);
 
-            $notification->status = 'sent';
-            $notification->sent_at = now();
-            $notification->provider_message_id = data_get($result, 'body.messageId');
-            $notification->provider_response = $result['body'] ?? null;
-            $notification->last_error = null;
-            $notification->error_type = null;
-            $notification->error_code = null;
-            $notification->last_retry_at = null;
-            $notification->next_retry_at = null;
-            $notification->attempts = $attemptNumber;
-            $notification->save();
+            DB::transaction(function () use ($notification, $attempt, $result, $attemptNumber, $start) {
+                $notification->status = NotificationStatus::Sent->value;
+                $notification->sent_at = now();
+                $notification->provider_message_id = data_get($result, 'body.messageId');
+                $notification->provider_response = $result['body'] ?? null;
+                $notification->last_error = null;
+                $notification->error_type = null;
+                $notification->error_code = null;
+                $notification->last_retry_at = null;
+                $notification->next_retry_at = null;
+                $notification->attempts = $attemptNumber;
+                $notification->save();
 
-            $attempt->status = 'sent';
-            $attempt->response_payload = $result['body'] ?? null;
-            $attempt->duration_ms = (int) ((microtime(true) - $start) * 1000);
-            $attempt->save();
+                $attempt->status = NotificationAttemptStatus::Sent->value;
+                $attempt->response_payload = $result['body'] ?? null;
+                $attempt->duration_ms = (int) ((microtime(true) - $start) * 1000);
+                $attempt->save();
+            });
         } catch (\Throwable $exception) {
             $httpStatus = $exception->getCode() ?: null;
             [$errorType, $errorCode] = $classifier->classify(is_numeric($httpStatus) ? (int) $httpStatus : null, $exception);
@@ -213,16 +230,18 @@ class SendNotificationJob implements ShouldQueue
             }
 
             if ($errorType === 'permanent' || $attemptNumber >= $notification->max_attempts) {
-                $notification->status = 'failed';
-                $notification->save();
+                DB::transaction(function () use ($notification, $attempt, $exception, $errorType, $errorCode, $httpStatus, $start) {
+                    $notification->status = NotificationStatus::Failed->value;
+                    $notification->save();
 
-                $attempt->status = 'failed';
-                $attempt->error_message = $exception->getMessage();
-                $attempt->error_type = $errorType;
-                $attempt->error_code = $errorCode;
-                $attempt->http_status = is_numeric($httpStatus) ? (int) $httpStatus : null;
-                $attempt->duration_ms = (int) ((microtime(true) - $start) * 1000);
-                $attempt->save();
+                    $attempt->status = NotificationAttemptStatus::Failed->value;
+                    $attempt->error_message = $exception->getMessage();
+                    $attempt->error_type = $errorType;
+                    $attempt->error_code = $errorCode;
+                    $attempt->http_status = is_numeric($httpStatus) ? (int) $httpStatus : null;
+                    $attempt->duration_ms = (int) ((microtime(true) - $start) * 1000);
+                    $attempt->save();
+                });
 
                 Log::error('Notification delivery failed permanently', [
                     'notification_id' => $notification->id,
@@ -237,19 +256,21 @@ class SendNotificationJob implements ShouldQueue
                 return;
             }
 
-            $notification->status = 'retrying';
-            $notification->last_retry_at = now();
             $delay = $retryPolicy->computeDelaySeconds($attemptNumber);
-            $notification->next_retry_at = now()->addSeconds($delay);
-            $notification->save();
+            DB::transaction(function () use ($notification, $attempt, $exception, $errorType, $errorCode, $httpStatus, $start, $delay) {
+                $notification->status = NotificationStatus::Retrying->value;
+                $notification->last_retry_at = now();
+                $notification->next_retry_at = now()->addSeconds($delay);
+                $notification->save();
 
-            $attempt->status = 'failed';
-            $attempt->error_message = $exception->getMessage();
-            $attempt->error_type = $errorType;
-            $attempt->error_code = $errorCode;
-            $attempt->http_status = is_numeric($httpStatus) ? (int) $httpStatus : null;
-            $attempt->duration_ms = (int) ((microtime(true) - $start) * 1000);
-            $attempt->save();
+                $attempt->status = NotificationAttemptStatus::Failed->value;
+                $attempt->error_message = $exception->getMessage();
+                $attempt->error_type = $errorType;
+                $attempt->error_code = $errorCode;
+                $attempt->http_status = is_numeric($httpStatus) ? (int) $httpStatus : null;
+                $attempt->duration_ms = (int) ((microtime(true) - $start) * 1000);
+                $attempt->save();
+            });
 
             $this->release($delay);
         }

@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use App\Http\Requests\StoreTemplateRequest;
 use App\Http\Requests\UpdateTemplateRequest;
 use App\Models\NotificationTemplate;
+use App\Services\NotificationTemplateCache;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Validation\Rule;
@@ -28,7 +29,7 @@ class NotificationTemplateController extends Controller
 
     public function show(string $templateId): JsonResponse
     {
-        $template = NotificationTemplate::query()->findOrFail($templateId);
+        $template = app(NotificationTemplateCache::class)->getOrFail($templateId);
 
         return response()->json($template);
     }
@@ -36,6 +37,9 @@ class NotificationTemplateController extends Controller
     public function store(StoreTemplateRequest $request): JsonResponse
     {
         $template = NotificationTemplate::query()->create($request->validated());
+        $cache = app(NotificationTemplateCache::class);
+        $cache->forget($template->id);
+        $cache->forgetRecent(10);
 
         return response()->json($template, 201);
     }
@@ -52,6 +56,9 @@ class NotificationTemplateController extends Controller
         }
 
         $template->update($data);
+        $cache = app(NotificationTemplateCache::class);
+        $cache->forget($template->id);
+        $cache->forgetRecent(10);
 
         return response()->json($template);
     }
@@ -60,6 +67,9 @@ class NotificationTemplateController extends Controller
     {
         $template = NotificationTemplate::query()->findOrFail($templateId);
         $template->delete();
+        $cache = app(NotificationTemplateCache::class);
+        $cache->forget($templateId);
+        $cache->forgetRecent(10);
 
         return response()->json(['message' => 'Template deleted.']);
     }

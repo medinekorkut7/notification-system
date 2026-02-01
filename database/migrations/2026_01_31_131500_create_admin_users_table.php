@@ -17,6 +17,8 @@ return new class extends Migration
             $table->boolean('is_active')->default(true);
             $table->timestamp('last_login_at')->nullable();
             $table->timestamps();
+            $table->softDeletes();
+            $table->index(['created_at'], 'admin_users_created_at_idx');
         });
     }
 

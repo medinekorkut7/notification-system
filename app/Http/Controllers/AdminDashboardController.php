@@ -2,9 +2,10 @@
 
 namespace App\Http\Controllers;
 
+use App\Http\Controllers\Traits\ChecksAdminRole;
 use App\Models\DeadLetterNotification;
 use App\Models\Notification;
-use App\Models\NotificationTemplate;
+use App\Services\NotificationTemplateCache;
 use App\Models\AdminUser;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -13,6 +14,7 @@ use Illuminate\Support\Facades\Redis;
 
 class AdminDashboardController extends Controller
 {
+    use ChecksAdminRole;
     private const COUNT_TOTAL = 'count(*) as total';
 
     public function index(Request $request)
@@ -27,10 +29,7 @@ class AdminDashboardController extends Controller
                 ->latest('created_at')
                 ->limit(5)
                 ->get(),
-            'templates' => NotificationTemplate::query()
-                ->latest('created_at')
-                ->limit(10)
-                ->get(),
+            'templates' => app(NotificationTemplateCache::class)->recent(10),
             'deadLetters' => DeadLetterNotification::query()
                 ->latest('created_at')
                 ->limit(10)
@@ -45,17 +44,6 @@ class AdminDashboardController extends Controller
                 ->get('provider_fallback_webhook_url', config('notifications.provider.fallback_webhook_url')),
             'isAdmin' => $this->isAdmin($request),
         ]);
-    }
-
-    private function isAdmin(Request $request): bool
-    {
-        $adminUserId = $request->session()->get('admin_user_id');
-        if (!$adminUserId) {
-            return false;
-        }
-
-        $admin = AdminUser::query()->find($adminUserId);
-        return $admin?->role === 'admin';
     }
 
     /**

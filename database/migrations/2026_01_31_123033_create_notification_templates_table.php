@@ -18,6 +18,8 @@ return new class extends Migration
             $table->text('content');
             $table->json('default_variables')->nullable();
             $table->timestamps();
+            $table->softDeletes();
+            $table->index(['created_at'], 'notification_templates_created_at_idx');
         });
     }
 

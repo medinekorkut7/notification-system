@@ -3,14 +3,16 @@
 namespace App\Http\Controllers;
 
 use App\Models\DeadLetterNotification;
-use App\Models\Notification;
-use App\Jobs\SendNotificationJob;
+use App\Services\DeadLetterRequeueService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
-use Illuminate\Support\Str;
 
 class DeadLetterNotificationController extends Controller
 {
+    public function __construct(
+        private readonly DeadLetterRequeueService $requeueService
+    ) {}
+
     public function index(Request $request): JsonResponse
     {
         $perPage = (int) $request->input('per_page', 25);
@@ -45,13 +47,14 @@ class DeadLetterNotificationController extends Controller
         $delay = max(0, (int) $request->input('delay_seconds', 0));
         $priority = (string) $request->input('priority', 'normal');
 
-        if (!in_array($priority, ['high', 'normal', 'low'], true)) {
+        if (!$this->requeueService->isValidPriority($priority)) {
             return response()->json([
                 'message' => 'Invalid priority.',
             ], 422);
         }
 
-        $result = $this->requeueItem($item, $delay, $priority);
+        $result = $this->requeueService->requeueSingle($item, $delay, $priority);
+
         if (!$result['ok']) {
             return response()->json([
                 'message' => $result['message'],
@@ -71,78 +74,20 @@ class DeadLetterNotificationController extends Controller
         $delay = max(0, (int) $request->input('delay_seconds', 0));
         $priority = (string) $request->input('priority', 'normal');
 
-        if (!in_array($priority, ['high', 'normal', 'low'], true)) {
+        if (!$this->requeueService->isValidPriority($priority)) {
             return response()->json([
                 'message' => 'Invalid priority.',
             ], 422);
         }
 
-        $query = DeadLetterNotification::query()->orderBy('created_at');
-        if ($channel !== '') {
-            $query->where('channel', $channel);
-        }
-
-        $items = $query->limit($limit)->get();
-        $requeued = 0;
-        $skipped = 0;
-
-        foreach ($items as $item) {
-            $result = $this->requeueItem($item, $delay, $priority);
-            if ($result['ok']) {
-                $requeued++;
-            } else {
-                $skipped++;
-            }
-        }
+        $items = $this->requeueService->queryForRequeue($limit, $channel);
+        $result = $this->requeueService->requeueBatch($items, $delay, $priority);
 
         return response()->json([
             'message' => 'Dead-letter requeue completed.',
             'requested' => $limit,
-            'requeued' => $requeued,
-            'skipped' => $skipped,
+            'requeued' => $result['requeued'],
+            'skipped' => $result['skipped'],
         ]);
-    }
-
-    /**
-     * @return array{ok: bool, notification_id?: string, message?: string}
-     */
-    private function requeueItem(DeadLetterNotification $item, int $delaySeconds = 0, string $priority = 'normal'): array
-    {
-        $payload = is_array($item->payload) ? $item->payload : [];
-
-        $recipient = $payload['to'] ?? $item->recipient;
-        $channel = $payload['channel'] ?? $item->channel;
-        $content = $payload['content'] ?? '';
-
-        if (!$recipient || !$channel) {
-            return ['ok' => false, 'message' => 'Dead-letter item is missing recipient or channel.'];
-        }
-
-        $idempotencyKey = $payload['idempotency_key'] ?? null;
-        if ($idempotencyKey) {
-            $idempotencyKey = $idempotencyKey . '-requeue-' . Str::uuid();
-        }
-
-        $notification = Notification::query()->create([
-            'batch_id' => null,
-            'channel' => $channel,
-            'priority' => $priority,
-            'recipient' => $recipient,
-            'content' => $content,
-            'status' => 'pending',
-            'idempotency_key' => $idempotencyKey,
-            'correlation_id' => (string) Str::uuid(),
-            'attempts' => 0,
-            'max_attempts' => 5,
-        ]);
-
-        $queue = config('notifications.queue_names.' . $priority, 'notifications-normal');
-        $job = (new SendNotificationJob($notification->id))->onQueue($queue);
-        if ($delaySeconds > 0) {
-            $job->delay($delaySeconds);
-        }
-        dispatch($job);
-
-        return ['ok' => true, 'notification_id' => $notification->id];
     }
 }

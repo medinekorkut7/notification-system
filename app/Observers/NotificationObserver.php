@@ -4,6 +4,8 @@ namespace App\Observers;
 
 use App\Models\Notification;
 use App\Models\NotificationBatch;
+use App\Enums\NotificationBatchStatus;
+use App\Enums\NotificationStatus;
 
 class NotificationObserver
 {
@@ -17,26 +19,10 @@ class NotificationObserver
             return;
         }
 
-        $batch = NotificationBatch::query()->find($notification->batch_id);
-        if (!$batch) {
-            return;
-        }
-
-        $counts = $batch->notifications()
-            ->selectRaw('status, count(*) as total')
-            ->groupBy('status')
-            ->pluck('total', 'status');
-
-        if (($counts['pending'] ?? 0) > 0 || ($counts['processing'] ?? 0) > 0 || ($counts['scheduled'] ?? 0) > 0 || ($counts['retrying'] ?? 0) > 0) {
-            $batch->status = 'pending';
-        } elseif (($counts['failed'] ?? 0) > 0) {
-            $batch->status = 'failed';
-        } elseif (($counts['cancelled'] ?? 0) > 0 && $counts->sum() === ($counts['cancelled'] ?? 0)) {
-            $batch->status = 'cancelled';
-        } else {
-            $batch->status = 'completed';
-        }
-
-        $batch->save();
+        // Dispatch debounced job for batch status update
+        // The job implements ShouldBeUnique, so multiple saves within uniqueFor seconds
+        // will result in only one job execution
+        dispatch(new \App\Jobs\UpdateBatchStatusJob($notification->batch_id))
+            ->delay(now()->addSeconds(2));
     }
 }

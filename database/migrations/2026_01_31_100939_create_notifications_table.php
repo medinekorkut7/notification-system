@@ -31,7 +31,13 @@ return new class extends Migration
             $table->json('provider_response')->nullable();
             $table->text('last_error')->nullable();
             $table->timestamps();
-
+            $table->index(['channel', 'status', 'created_at'], 'notifications_channel_status_created_at_idx');
+            $table->index(['priority', 'status', 'created_at'], 'notifications_priority_status_created_at_idx');
+            $table->index(['status', 'processing_started_at'], 'notifications_status_processing_started_idx');
+            $table->index(['status', 'scheduled_at'], 'notifications_status_scheduled_at_idx');
+            $table->index(['status', 'created_at'], 'notifications_status_created_at_idx');
+            $table->index(['batch_id', 'created_at'], 'notifications_batch_created_at_idx');
+            $table->index(['created_at'], 'notifications_created_at_idx');
             $table->foreign('batch_id')->references('id')->on('notification_batches')->nullOnDelete();
         });
     }

@@ -33,19 +33,34 @@ class DispatchScheduledNotifications extends Command
             return;
         }
 
+        // Fetch only necessary columns for dispatching
         $dueNotifications = Notification::query()
+            ->select(['id', 'priority'])
             ->where('status', 'scheduled')
             ->whereNotNull('scheduled_at')
             ->where('scheduled_at', '<=', now())
             ->limit(500)
             ->get();
 
-        foreach ($dueNotifications as $notification) {
-            $notification->status = 'pending';
-            $notification->save();
+        if ($dueNotifications->isEmpty()) {
+            $this->info('No scheduled notifications to dispatch.');
+            return;
+        }
 
-            dispatch((new SendNotificationJob($notification->id))
-                ->onQueue(config('notifications.queue_names.' . $notification->priority, 'notifications-normal')));
+        $ids = $dueNotifications->pluck('id')->all();
+
+        // Bulk update all statuses in a single query
+        Notification::whereIn('id', $ids)->update(['status' => 'pending']);
+
+        // Group by priority and dispatch jobs
+        $jobsByQueue = $dueNotifications->groupBy(function ($notification) {
+            return config('notifications.queue_names.' . $notification->priority, 'notifications-normal');
+        });
+
+        foreach ($jobsByQueue as $queue => $notifications) {
+            foreach ($notifications as $notification) {
+                dispatch((new SendNotificationJob($notification->id))->onQueue($queue));
+            }
         }
 
         $this->info("Dispatched {$dueNotifications->count()} scheduled notifications.");
